@@ -10,7 +10,7 @@
                 <div class="row mb-4">
                     <div class="col-md-3">
                         <div class="border rounded p-3 text-center">
-                            <div class="text-muted small">Total PDF-uri verificate</div>
+                            <div class="text-muted small">Total documente verificate</div>
                             <div class="fw-bold fs-3">{{ results|length }}</div>
                         </div>
                     </div>
@@ -53,7 +53,7 @@
                         {% for issue in r.issues %}
                         <tr>
                             {% if loop.first %}
-                            <td rowspan="{{ r.issues|length }}" class="fw-bold align-middle">{{ r.pdf_file }}</td>
+                            <td rowspan="{{ r.issues|length }}" class="fw-bold align-middle">{{ r.source_file }}</td>
                             <td rowspan="{{ r.issues|length }}" class="text-center align-middle">{{ r.nr_pv }}</td>
                             <td rowspan="{{ r.issues|length }}" class="align-middle">{{ r.uat }}</td>
                             <td rowspan="{{ r.issues|length }}" class="text-center align-middle">{{ r.pozitie_hg }}</td>
@@ -68,11 +68,11 @@
                 </table>
                 {% else %}
                 <div class="alert alert-success fs-5 text-center">
-                    Toate PDF-urile corespund cu datele din MASTER!
+                    Toate documentele corespund cu datele din MASTER!
                 </div>
                 {% endif %}
 
-                <h5 class="mt-4">Toate PDF-urile:</h5>
+                <h5 class="mt-4">Toate documentele:</h5>
                 <table class="table table-bordered table-sm">
                     <thead class="table-light">
                         <tr>
@@ -88,7 +88,7 @@
                         {% for r in results %}
                         <tr class="{{ 'table-danger' if r.issues else 'table-success' }}">
                             <td>{{ loop.index }}</td>
-                            <td>{{ r.pdf_file }}</td>
+                            <td>{{ r.source_file }}</td>
                             <td class="text-center">{{ r.nr_pv }}</td>
                             <td>{{ r.uat }}</td>
                             <td>{{ r.proprietar }}</td>

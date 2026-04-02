@@ -30,20 +30,12 @@
     </div>
 </div>
 <script>
-    // Start processing
-    fetch('/run-process', {method: 'POST'}).then(r => {
-        if (!r.ok) return r.json().then(d => { throw new Error(d.error || 'Eroare'); });
-        return r.json();
-    }).then(() => {
-        document.getElementById('processing').style.display = 'none';
-        document.getElementById('done').style.display = 'block';
-    }).catch(e => {
-        document.getElementById('processing').style.display = 'none';
-        document.getElementById('error').style.display = 'block';
-        document.getElementById('errorText').textContent = e.message;
+    // Start processing (returns immediately, runs in background)
+    fetch('/run-process', {method: 'POST'}).then(r => r.json()).catch(e => {
+        // Even if fetch fails due to timeout, background thread continues
     });
 
-    // Poll progress
+    // Poll progress until done
     const interval = setInterval(() => {
         fetch('/progress').then(r => r.json()).then(d => {
             if (d.total > 0) {
@@ -53,8 +45,18 @@
                 document.getElementById('progressText').textContent =
                     `${d.current} / ${d.total} - ${d.file}`;
             }
-            if (d.done) clearInterval(interval);
+            if (d.done) {
+                clearInterval(interval);
+                if (d.error) {
+                    document.getElementById('processing').style.display = 'none';
+                    document.getElementById('error').style.display = 'block';
+                    document.getElementById('errorText').textContent = d.error;
+                } else {
+                    document.getElementById('processing').style.display = 'none';
+                    document.getElementById('done').style.display = 'block';
+                }
+            }
         }).catch(() => {});
-    }, 1000);
+    }, 2000);
 </script>
 {% endblock %}

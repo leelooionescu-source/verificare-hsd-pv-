@@ -2,6 +2,7 @@ import os
 import uuid
 import shutil
 import time
+import threading
 from flask import Flask, render_template, request, redirect, url_for, session, send_from_directory, flash, jsonify
 from process_verify import read_master, process_all, generate_report
 
@@ -15,8 +16,9 @@ OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Store processing progress
+# Store processing progress and results
 progress_store = {}
+results_store = {}
 
 
 def get_session_dir(subdir):
@@ -95,32 +97,39 @@ def run_process():
 
     master_path = session['master_path']
     pdf_dir = session['pdf_dir']
-    output_dir = get_session_dir('output')
-
     sid = session.get('session_id', '')
-    progress_store[sid] = {'current': 0, 'total': 0, 'file': '', 'done': False}
+    output_dir_path = get_session_dir('output')
 
-    def progress_cb(current, total, filename):
-        progress_store[sid] = {'current': current, 'total': total, 'file': filename, 'done': False}
+    progress_store[sid] = {'current': 0, 'total': 0, 'file': 'Pornire...', 'done': False}
 
-    try:
-        results, master_entries = process_all(master_path, pdf_dir, progress_callback=progress_cb)
+    # Store session data for background thread
+    results_store[sid] = None
 
-        report_path = os.path.join(output_dir, 'Raport neconcordante.xlsx')
-        generate_report(results, report_path)
+    def background_process():
+        def progress_cb(current, total, filename):
+            progress_store[sid] = {'current': current, 'total': total, 'file': filename, 'done': False}
 
-        session['results'] = results
-        session['report_path'] = report_path
-        session['total_ok'] = sum(1 for r in results if not r['issues'])
-        session['total_issues'] = sum(1 for r in results if r['issues'])
-        session['total_neconcordante'] = sum(len(r['issues']) for r in results)
+        try:
+            results, master_entries = process_all(master_path, pdf_dir, progress_callback=progress_cb)
 
-        progress_store[sid] = {'current': len(results), 'total': len(results), 'file': 'Done', 'done': True}
-    except Exception as e:
-        progress_store[sid] = {'current': 0, 'total': 0, 'file': str(e), 'done': True, 'error': str(e)}
-        return jsonify({'error': str(e)}), 500
+            report_path = os.path.join(output_dir_path, 'Raport neconcordante.xlsx')
+            generate_report(results, report_path)
 
-    return jsonify({'ok': True})
+            results_store[sid] = {
+                'results': results,
+                'report_path': report_path,
+                'total_ok': sum(1 for r in results if not r['issues']),
+                'total_issues': sum(1 for r in results if r['issues']),
+                'total_neconcordante': sum(len(r['issues']) for r in results),
+            }
+            progress_store[sid] = {'current': len(results), 'total': len(results), 'file': 'Finalizat', 'done': True}
+        except Exception as e:
+            progress_store[sid] = {'current': 0, 'total': 0, 'file': str(e), 'done': True, 'error': str(e)}
+
+    thread = threading.Thread(target=background_process)
+    thread.start()
+
+    return jsonify({'ok': True, 'message': 'Processing started'})
 
 
 @app.route('/progress')
@@ -132,15 +141,20 @@ def progress():
 
 @app.route('/results')
 def results():
-    if 'results' not in session:
+    sid = session.get('session_id', '')
+    data = results_store.get(sid)
+    if not data:
         flash('Nu există rezultate.', 'error')
         return redirect(url_for('index'))
 
+    # Store report path in session for download
+    session['report_path'] = data['report_path']
+
     return render_template('results.html',
-        results=session['results'],
-        total_ok=session['total_ok'],
-        total_issues=session['total_issues'],
-        total_neconcordante=session['total_neconcordante'])
+        results=data['results'],
+        total_ok=data['total_ok'],
+        total_issues=data['total_issues'],
+        total_neconcordante=data['total_neconcordante'])
 
 
 @app.route('/download-report')

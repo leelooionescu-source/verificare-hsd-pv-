@@ -53,9 +53,9 @@ def upload():
         flash('Fișierul MASTER este obligatoriu!', 'error')
         return redirect(url_for('index'))
 
-    pdf_files = request.files.getlist('pdfs')
-    if not pdf_files or all(f.filename == '' for f in pdf_files):
-        flash('Încărcați cel puțin un fișier PDF!', 'error')
+    doc_files = request.files.getlist('docs')
+    if not doc_files or all(f.filename == '' for f in doc_files):
+        flash('Încărcați cel puțin un fișier Word (.docx)!', 'error')
         return redirect(url_for('index'))
 
     upload_dir = get_session_dir('uploads')
@@ -63,21 +63,24 @@ def upload():
     shutil.rmtree(upload_dir, ignore_errors=True)
     os.makedirs(upload_dir, exist_ok=True)
 
-    pdf_dir = os.path.join(upload_dir, 'pdfs')
-    os.makedirs(pdf_dir, exist_ok=True)
+    docs_dir = os.path.join(upload_dir, 'docs')
+    os.makedirs(docs_dir, exist_ok=True)
 
     master_path = os.path.join(upload_dir, 'master.xlsx')
     master_file.save(master_path)
 
-    pdf_count = 0
-    for f in pdf_files:
-        if f.filename and f.filename.lower().endswith('.pdf'):
-            f.save(os.path.join(pdf_dir, f.filename))
-            pdf_count += 1
+    doc_count = 0
+    doc_paths = []
+    for f in doc_files:
+        if f.filename and f.filename.lower().endswith('.docx'):
+            fpath = os.path.join(docs_dir, f.filename)
+            f.save(fpath)
+            doc_paths.append(fpath)
+            doc_count += 1
 
     session['master_path'] = master_path
-    session['pdf_dir'] = pdf_dir
-    session['pdf_count'] = pdf_count
+    session['doc_paths'] = doc_paths
+    session['doc_count'] = doc_count
 
     return redirect(url_for('process'))
 
@@ -87,7 +90,7 @@ def process():
     if 'master_path' not in session:
         flash('Încărcați fișierele mai întâi.', 'error')
         return redirect(url_for('index'))
-    return render_template('processing.html', pdf_count=session.get('pdf_count', 0))
+    return render_template('processing.html', doc_count=session.get('doc_count', 0))
 
 
 @app.route('/run-process', methods=['POST'])
@@ -96,13 +99,12 @@ def run_process():
         return jsonify({'error': 'No files'}), 400
 
     master_path = session['master_path']
-    pdf_dir = session['pdf_dir']
+    doc_paths = session['doc_paths']
     sid = session.get('session_id', '')
     output_dir_path = get_session_dir('output')
 
     progress_store[sid] = {'current': 0, 'total': 0, 'file': 'Pornire...', 'done': False}
 
-    # Store session data for background thread
     results_store[sid] = None
 
     def background_process():
@@ -110,7 +112,7 @@ def run_process():
             progress_store[sid] = {'current': current, 'total': total, 'file': filename, 'done': False}
 
         try:
-            results, master_entries = process_all(master_path, pdf_dir, progress_callback=progress_cb)
+            results, master_entries = process_all(master_path, doc_paths, progress_callback=progress_cb)
 
             report_path = os.path.join(output_dir_path, 'Raport neconcordante.xlsx')
             generate_report(results, report_path)

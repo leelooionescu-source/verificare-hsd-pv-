@@ -1,16 +1,9 @@
 import pandas as pd
-import pytesseract
 import re
 import os
-import sys
-from pdf2image import convert_from_path
-from pypdf import PdfReader
+from docx import Document
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from copy import copy
-
-if sys.platform == 'win32':
-    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 
 def read_master(master_path):
@@ -19,7 +12,6 @@ def read_master(master_path):
     all_entries = []
     for sheet_name in xls.sheet_names:
         df = pd.read_excel(xls, sheet_name=sheet_name, header=0)
-        cols = {str(c).strip().upper(): i for i, c in enumerate(df.columns)}
 
         for i in range(len(df)):
             row = df.iloc[i]
@@ -70,46 +62,54 @@ def read_master(master_path):
     return all_entries
 
 
-def ocr_pdf(pdf_path):
-    """Extrage text din PDF (scanat sau text)."""
-    # Try text extraction first
-    reader = PdfReader(pdf_path)
-    full_text = ''
-    for page in reader.pages:
-        t = page.extract_text()
-        if t:
-            full_text += t + '\n'
-
-    if len(full_text.strip()) > 200:
-        return full_text
-
-    # OCR fallback
-    images = convert_from_path(pdf_path, dpi=250)
-    texts = []
-    for img in images:
-        t = pytesseract.image_to_string(img, lang='ron')
-        texts.append(t)
-    return '\n'.join(texts)
+def read_docx(docx_path):
+    """Extrage text complet din fisier .docx."""
+    doc = Document(docx_path)
+    paragraphs = [p.text for p in doc.paragraphs]
+    # Also extract from tables
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                paragraphs.append(cell.text)
+    return '\n'.join(paragraphs)
 
 
-def extract_data_from_pdf(text, filename):
-    """Extrage date structurate din textul OCR al unui H si PV."""
-    data = {'filename': filename, 'raw_text_length': len(text)}
+def split_sections(text):
+    """Separa textul in sectiuni individuale H+PV (cate una per numar)."""
+    # Split by "CONSILIUL LOCAL" - each H+PV starts with this
+    parts = re.split(r'(?=CONSILIUL\s+LOCAL)', text)
+    parts = [p for p in parts if p.strip() and len(p) > 500]
 
-    # Nr. HSD/PV si data
-    m = re.search(r'nr\.\s*(\d+)\s*din\s*([\d.]+\.\d{4})', text, re.IGNORECASE)
+    # Group by nr - Hotararea si PV au acelasi numar
+    sections = {}
+    for p in parts:
+        m = re.search(r'nr\.\s*(\d+)\s*din\s*([\d.]+)', p[:500])
+        if m:
+            nr = int(m.group(1))
+            if nr not in sections:
+                sections[nr] = ''
+            sections[nr] += '\n' + p
+
+    return sections
+
+
+def extract_data_from_text(text, nr_pv, source_file):
+    """Extrage date structurate din textul unui H si PV."""
+    data = {'source_file': source_file, 'nr_pv': nr_pv}
+
+    # Data
+    m = re.search(r'nr\.\s*\d+\s*din\s*([\d.]+\.\d{4})', text)
     if m:
-        data['nr_pv'] = int(m.group(1))
-        data['data'] = m.group(2)
+        data['data'] = m.group(1)
 
-    # UAT
-    m = re.search(r'CONSILIUL\s+LOCAL\s+([A-ZĂÂÎȘȚ\-\s]+?)\s*,\s*JUDE[ŢȚ]UL\s+([A-ZĂÂÎȘȚ]+)', text)
+    # UAT si Judet
+    m = re.search(r'CONSILIUL\s+LOCAL\s+(.+?)\s*,\s*JUDE[ȚŢ]UL\s+(\w+)', text)
     if m:
         data['uat'] = m.group(1).strip()
         data['judet'] = m.group(2).strip()
 
     # Pozitie HG
-    m = re.search(r'pozi[tț]i[ae]\s*(?:nr\.?)?\s*(\d+)\s*din\s*Anex', text, re.IGNORECASE)
+    m = re.search(r'pozi[țţ]i[ae]\s*(?:nr\.?)?\s*(\d+)\s*din\s*Anex', text, re.IGNORECASE)
     if m:
         data['pozitie_hg'] = m.group(1)
 
@@ -129,255 +129,193 @@ def extract_data_from_pdf(text, filename):
         data['tarla'] = m.group(1)
         data['parcela'] = m.group(2)
 
-    # Suprafata expropriata
+    # Suprafete expropriate
     surfaces = re.findall(r'Teren\d?\s+[iî]n\s+suprafa[tț][aă]\s+de\s+([\d.,]+)\s*mp', text, re.IGNORECASE)
     if surfaces:
-        data['suprafete_pdf'] = [s.replace('.', '').replace(',', '.') for s in surfaces]
+        data['suprafete'] = [s.replace('.', '').replace(',', '.') for s in surfaces]
 
-    # Valoare despagubiri
-    vals = re.findall(r'([\d.,]+)\s*LEI\s+pentru\s+imobilul\s+teren', text, re.IGNORECASE)
+    # Valori despagubiri
+    vals = re.findall(r'([\d.,]+)\s*LEI.*?(?:pentru\s+imobilul\s+teren|stabilit[aă]\s+cu\s+titlu)', text, re.IGNORECASE)
     if vals:
-        data['valori_pdf'] = [v.replace('.', '').replace(',', '.') for v in vals]
+        data['valori'] = [v.replace('.', '').replace(',', '.') for v in vals]
 
     # Suma totala
     m = re.search(r'suma\s+de\s+([\d.,]+)\s*LEI', text, re.IGNORECASE)
     if m:
-        data['suma_totala_pdf'] = m.group(1).replace('.', '').replace(',', '.')
+        data['suma_totala'] = m.group(1).replace('.', '').replace(',', '.')
 
-    # Proprietar - multiple strategies
-    prop_name = None
-    # Strategy 1: after "supus exproprierii" + numbered list
-    m1 = re.search(r'supus[eă]?\s+exproprierii.*?\n\s*1[\.\)]\s*(.+?)(?:,\s*cu\s+(?:domiciliul|sediul)|;\s*\n)', text, re.IGNORECASE | re.DOTALL)
-    if m1:
-        prop_name = re.sub(r'\s+', ' ', m1.group(1)).strip()
-    # Strategy 2: "Art. 1" section with proprietar
-    if not prop_name:
-        m2 = re.search(r'Art\.\s*1\..*?localitat.*?(?:1[\.\)]\s*)?([A-ZĂÂÎȘȚÜÖ][A-ZĂÂÎȘȚÜÖ\s\-\.]+(?:SRL|SA|S\.R\.L\.|S\.A\.)?)\s*,?\s*(?:cu\s+(?:domiciliul|sediul)|$)', text, re.DOTALL)
-        if m2:
-            prop_name = m2.group(1).strip()
-    # Filter out false positives
-    if prop_name and any(kw in prop_name for kw in ['REPREZENTANT', 'Primaria', 'AV.', 'LEI', 'teren']):
-        prop_name = None
-    if prop_name:
-        data['proprietar_pdf'] = prop_name
+    # Proprietar
+    m = re.search(r'supus[eă]?\s+exproprierii.*?\n\s*1[\.\)]\s*(.+?)(?:,\s*cu\s+(?:domiciliul|sediul)|;\s*\n)', text, re.IGNORECASE | re.DOTALL)
+    if m:
+        name = re.sub(r'\s+', ' ', m.group(1)).strip()
+        if not any(kw in name for kw in ['REPREZENTANT', 'Primaria', 'AV.', 'LEI', 'teren']):
+            data['proprietar'] = name
 
     # Decizie expropriere
     m = re.search(r'[Dd]eciziei\s+de\s+expropriere\s+nr\.\s*(\d+)\s+din\s+([\d.]+)', text)
     if m:
-        data['decizie_expropriere_pdf'] = f'nr. {m.group(1)} din {m.group(2)}'
+        data['decizie_expropriere'] = f'nr. {m.group(1)} din {m.group(2)}'
 
     # Decizie comisie
-    m = re.search(r'[Dd]eciziei\s+nr\.\s*(\d+)\s*\n?\s*din\s+([\d.]+)\s*(?:\d+\s*)?emis', text)
+    m = re.search(r'[Dd]eciziei\s+nr\.\s*(\d+)\s+din\s+([\d.]+)\s+emis', text)
     if m:
-        data['decizie_comisie_pdf'] = f'nr. {m.group(1)} din {m.group(2)}'
+        data['decizie_comisie'] = f'nr. {m.group(1)} din {m.group(2)}'
 
-    # HG number - look for the specific pattern "H.G. nr. XXXX/YYYY" or "Guvernului nr. XXXX/YYYY"
+    # HG
     m = re.search(r'(?:Guvernului|H\.?\s*G\.?)\s*nr\.?\s*(\d{2,4}\s*/\s*\d{4})', text)
     if m:
-        data['hg_pdf'] = re.sub(r'\s', '', m.group(1))
-
-    # Membri comisie - cautam numele dupa REPREZENTANT
-    membri = re.findall(r'REPREZENTANT.*?\s{2,}([A-ZĂÂÎȘȚ][a-zăâîșț]+(?:\s+[A-ZĂÂÎȘȚ\-][a-zăâîșțA-ZĂÂÎȘȚ\-]+)+)', text)
-    if membri:
-        data['membri_pdf'] = [m.strip() for m in membri]
-    # Si AV.
-    avocati = re.findall(r'AV\.\s+([A-ZĂÂÎȘȚ][A-ZĂÂÎȘȚ\-\s]+)', text)
-    if avocati:
-        if 'membri_pdf' not in data:
-            data['membri_pdf'] = []
-        data['membri_pdf'].extend([a.strip() for a in avocati])
-
-    # Rezulta / Nu rezulta
-    if 'nu a fost depus' in text.lower() or 'nu rezulta' in text.lower():
-        data['rezulta_pdf'] = 'NU REZULTA'
-    elif 'rezulta' in text.lower():
-        data['rezulta_pdf'] = 'REZULTA'
+        data['hg'] = re.sub(r'\s', '', m.group(1))
 
     return data
 
 
-def compare_entry(master, pdf):
-    """Compara datele din MASTER cu cele din PDF. Returneaza lista de neconcordante."""
+def compare_entry(master, doc_data):
+    """Compara datele din MASTER cu cele din document. Returneaza lista de neconcordante."""
     issues = []
 
     def normalize(s):
-        return re.sub(r'\s+', ' ', str(s).strip().upper().replace('Ț', 'T').replace('Ş', 'S').replace('Ă', 'A').replace('Â', 'A').replace('Î', 'I'))
+        s = str(s).strip().upper()
+        for old, new in [('Ț', 'T'), ('Ş', 'S'), ('Ș', 'S'), ('Ă', 'A'), ('Â', 'A'), ('Î', 'I'), ('Ţ', 'T')]:
+            s = s.replace(old, new)
+        return re.sub(r'\s+', ' ', s)
 
-    def check(field_name, master_val, pdf_val):
-        if not pdf_val:
-            return  # nu am reusit sa extrag din PDF, nu raportam
+    def check(field_name, master_val, doc_val):
+        if not doc_val:
+            return
         m = normalize(master_val)
-        p = normalize(pdf_val)
+        p = normalize(doc_val)
         if m and p and m != p:
-            # Check partial match for names and long strings
             if m in p or p in m:
                 return
-            issues.append({
-                'camp': field_name,
-                'master': str(master_val).strip(),
-                'pdf': str(pdf_val).strip(),
-            })
+            issues.append({'camp': field_name, 'master': str(master_val).strip(), 'document': str(doc_val).strip()})
 
-    # UAT
-    check('UAT', master.get('uat', ''), pdf.get('uat', ''))
-
-    # Judet
-    check('Județ', master.get('judet', ''), pdf.get('judet', ''))
-
-    # Pozitie HG
-    check('Poziție HG', master.get('pozitie_hg', ''), pdf.get('pozitie_hg', ''))
-
-    # Nr cadastral
-    check('Nr. cadastral', master.get('nr_cadastral', ''), pdf.get('nr_cadastral', ''))
-
-    # Nr CF
-    check('Nr. CF', master.get('nr_cf', ''), pdf.get('nr_cf', ''))
-
-    # Tarla
-    check('Tarla', master.get('tarla', ''), pdf.get('tarla', ''))
-
-    # Parcela
-    check('Parcela', master.get('parcela', ''), pdf.get('parcela', ''))
-
-    # Data
-    check('Data', master.get('data', ''), pdf.get('data', ''))
+    check('UAT', master.get('uat', ''), doc_data.get('uat', ''))
+    check('Județ', master.get('judet', ''), doc_data.get('judet', ''))
+    check('Poziție HG', master.get('pozitie_hg', ''), doc_data.get('pozitie_hg', ''))
+    check('Nr. cadastral', master.get('nr_cadastral', ''), doc_data.get('nr_cadastral', ''))
+    check('Nr. CF', master.get('nr_cf', ''), doc_data.get('nr_cf', ''))
+    check('Tarla', master.get('tarla', ''), doc_data.get('tarla', ''))
+    check('Parcela', master.get('parcela', ''), doc_data.get('parcela', ''))
+    check('Data', master.get('data', ''), doc_data.get('data', ''))
+    check('HG', master.get('hg', ''), doc_data.get('hg', ''))
 
     # Proprietar
-    if pdf.get('proprietar_pdf'):
+    if doc_data.get('proprietar'):
         m_name = normalize(master.get('nume1', ''))
-        p_name = normalize(pdf.get('proprietar_pdf', ''))
+        p_name = normalize(doc_data.get('proprietar', ''))
         if m_name and p_name:
-            # Check if any significant part matches
             m_parts = set(m_name.split())
             p_parts = set(p_name.split())
             common = m_parts & p_parts
             if len(common) < min(2, len(m_parts)):
-                issues.append({
-                    'camp': 'Proprietar',
-                    'master': master.get('nume1', ''),
-                    'pdf': pdf.get('proprietar_pdf', ''),
-                })
+                issues.append({'camp': 'Proprietar', 'master': master.get('nume1', ''), 'document': doc_data.get('proprietar', '')})
 
     # Suprafete
-    if pdf.get('suprafete_pdf'):
+    if doc_data.get('suprafete'):
         master_sups = []
         for key in ['suprafata_exp1', 'suprafata_exp2']:
             v = master.get(key, '')
-            if v and v != '' and v != '0':
+            if v and v not in ('', '0', '-'):
                 try:
                     master_sups.append(float(str(v).replace(',', '.')))
                 except ValueError:
                     pass
-        pdf_sups = []
-        for s in pdf['suprafete_pdf']:
+        doc_sups = []
+        for s in doc_data['suprafete']:
             try:
-                pdf_sups.append(float(s))
+                doc_sups.append(float(s))
             except ValueError:
                 pass
-        if master_sups and pdf_sups:
+        if master_sups and doc_sups:
             for ms in master_sups:
-                if not any(abs(ms - ps) < 1 for ps in pdf_sups):
+                if not any(abs(ms - ds) < 1 for ds in doc_sups):
                     issues.append({
                         'camp': 'Suprafață expropriată',
-                        'master': str(int(ms)),
-                        'pdf': ', '.join(str(int(p)) for p in pdf_sups),
+                        'master': ', '.join(str(int(s)) for s in master_sups),
+                        'document': ', '.join(str(int(s)) for s in doc_sups),
                     })
                     break
 
     # Valori
-    if pdf.get('valori_pdf') or pdf.get('suma_totala_pdf'):
+    if doc_data.get('suma_totala'):
         master_vals = []
         for key in ['valoare1', 'valoare2']:
             v = master.get(key, '')
-            if v and v != '' and v != '0':
+            if v and v not in ('', '0', '-'):
                 try:
                     master_vals.append(float(str(v).replace(',', '.')))
                 except ValueError:
                     pass
         master_total = sum(master_vals)
-        pdf_total = None
-        if pdf.get('suma_totala_pdf'):
-            try:
-                pdf_total = float(pdf['suma_totala_pdf'])
-            except ValueError:
-                pass
-        if master_total > 0 and pdf_total and abs(master_total - pdf_total) > 1:
+        try:
+            doc_total = float(doc_data['suma_totala'])
+        except ValueError:
+            doc_total = None
+        if master_total > 0 and doc_total and abs(master_total - doc_total) > 1:
             issues.append({
-                'camp': 'Valoare despăgubiri totală',
+                'camp': 'Valoare despăgubiri',
                 'master': f'{master_total:,.2f}'.replace(',', '.'),
-                'pdf': f'{pdf_total:,.2f}'.replace(',', '.'),
+                'document': f'{doc_total:,.2f}'.replace(',', '.'),
             })
 
     # Decizie expropriere
-    if pdf.get('decizie_expropriere_pdf'):
-        m_dec = normalize(master.get('decizie_expropriere', ''))
-        p_dec = normalize(pdf.get('decizie_expropriere_pdf', ''))
-        # Extract just numbers for comparison
-        m_nums = re.findall(r'\d+', m_dec)
-        p_nums = re.findall(r'\d+', p_dec)
-        if m_nums and p_nums and m_nums != p_nums:
-            issues.append({
-                'camp': 'Decizie expropriere',
-                'master': master.get('decizie_expropriere', ''),
-                'pdf': pdf.get('decizie_expropriere_pdf', ''),
-            })
-
-    # HG
-    if pdf.get('hg_pdf'):
-        m_hg = re.sub(r'\s', '', str(master.get('hg', '')))
-        p_hg = re.sub(r'\s', '', str(pdf.get('hg_pdf', '')))
-        if m_hg and p_hg and m_hg != p_hg:
-            issues.append({
-                'camp': 'HG',
-                'master': master.get('hg', ''),
-                'pdf': pdf.get('hg_pdf', ''),
-            })
+    if doc_data.get('decizie_expropriere'):
+        m_nums = re.findall(r'\d+', normalize(master.get('decizie_expropriere', '')))
+        d_nums = re.findall(r'\d+', normalize(doc_data.get('decizie_expropriere', '')))
+        if m_nums and d_nums and m_nums != d_nums:
+            issues.append({'camp': 'Decizie expropriere', 'master': master.get('decizie_expropriere', ''), 'document': doc_data.get('decizie_expropriere', '')})
 
     return issues
 
 
-def process_all(master_path, pdf_folder, progress_callback=None):
-    """Proceseaza MASTER + toate PDF-urile. Returneaza rezultate."""
+def process_all(master_path, docx_files, progress_callback=None):
+    """Proceseaza MASTER + toate fisierele .docx. Returneaza rezultate."""
     master_entries = read_master(master_path)
     master_by_pv = {e['nr_pv']: e for e in master_entries}
 
-    pdf_files = sorted([f for f in os.listdir(pdf_folder) if f.lower().endswith('.pdf')],
-                       key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else 0)
-
     results = []
-    for idx, pdf_file in enumerate(pdf_files):
-        if progress_callback:
-            progress_callback(idx + 1, len(pdf_files), pdf_file)
+    total_sections = 0
 
-        pdf_path = os.path.join(pdf_folder, pdf_file)
-        text = ocr_pdf(pdf_path)
-        pdf_data = extract_data_from_pdf(text, pdf_file)
+    # First pass: count total sections
+    file_sections = []
+    for docx_path in docx_files:
+        filename = os.path.basename(docx_path)
+        text = read_docx(docx_path)
+        sections = split_sections(text)
+        file_sections.append((filename, sections))
+        total_sections += len(sections)
 
-        nr_pv = pdf_data.get('nr_pv')
-        if nr_pv and nr_pv in master_by_pv:
-            master_entry = master_by_pv[nr_pv]
-            issues = compare_entry(master_entry, pdf_data)
-            results.append({
-                'pdf_file': pdf_file,
-                'nr_pv': nr_pv,
-                'uat': master_entry.get('uat', ''),
-                'pozitie_hg': master_entry.get('pozitie_hg', ''),
-                'proprietar': master_entry.get('nume1', ''),
-                'issues': issues,
-                'pdf_data': pdf_data,
-                'status': 'NECONCORDANȚE' if issues else 'OK',
-            })
-        else:
-            results.append({
-                'pdf_file': pdf_file,
-                'nr_pv': nr_pv,
-                'uat': pdf_data.get('uat', ''),
-                'pozitie_hg': pdf_data.get('pozitie_hg', ''),
-                'proprietar': pdf_data.get('proprietar_pdf', ''),
-                'issues': [{'camp': 'Nr. PV', 'master': 'NEGĂSIT', 'pdf': str(nr_pv)}],
-                'pdf_data': pdf_data,
-                'status': 'NEGĂSIT ÎN MASTER',
-            })
+    processed = 0
+    for filename, sections in file_sections:
+        for nr_pv, section_text in sorted(sections.items()):
+            processed += 1
+            if progress_callback:
+                progress_callback(processed, total_sections, f'{filename} - H/PV nr. {nr_pv}')
+
+            doc_data = extract_data_from_text(section_text, nr_pv, filename)
+
+            if nr_pv in master_by_pv:
+                master_entry = master_by_pv[nr_pv]
+                issues = compare_entry(master_entry, doc_data)
+                results.append({
+                    'source_file': filename,
+                    'nr_pv': nr_pv,
+                    'uat': master_entry.get('uat', ''),
+                    'pozitie_hg': master_entry.get('pozitie_hg', ''),
+                    'proprietar': master_entry.get('nume1', ''),
+                    'issues': issues,
+                    'status': 'NECONCORDANȚE' if issues else 'OK',
+                })
+            else:
+                results.append({
+                    'source_file': filename,
+                    'nr_pv': nr_pv,
+                    'uat': doc_data.get('uat', ''),
+                    'pozitie_hg': doc_data.get('pozitie_hg', ''),
+                    'proprietar': doc_data.get('proprietar', ''),
+                    'issues': [{'camp': 'Nr. PV', 'master': 'NEGĂSIT', 'document': str(nr_pv)}],
+                    'status': 'NEGĂSIT ÎN MASTER',
+                })
 
     return results, master_entries
 
@@ -394,12 +332,12 @@ def generate_report(results, output_path):
     tb = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
     ca = Alignment(horizontal='center', vertical='center', wrap_text=True)
 
-    ws.merge_cells('A1:G1')
+    ws.merge_cells('A1:H1')
     ws['A1'] = 'RAPORT NECONCORDANȚE - VERIFICARE H SI PV vs MASTER'
     ws['A1'].font = Font(name='Arial', bold=True, size=14, color='C00000')
     ws['A1'].alignment = Alignment(horizontal='center')
 
-    headers = ['Nr.\ncrt.', 'Fișier PDF', 'Nr.\nPV/HSD', 'UAT', 'Poziție\nHG', 'Câmp cu\nneconcordanță', 'Valoare\nMASTER', 'Valoare\nPDF']
+    headers = ['Nr.\ncrt.', 'Fișier sursă', 'Nr.\nPV/HSD', 'UAT', 'Poziție\nHG', 'Câmp cu\nneconcordanță', 'Valoare\nMASTER', 'Valoare\nDocument']
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=3, column=col, value=h)
         cell.font = hf
@@ -409,12 +347,13 @@ def generate_report(results, output_path):
 
     row = 4
     crt = 0
-    issues_only = [r for r in results if r['issues']]
-    for r in issues_only:
+    for r in results:
+        if not r['issues']:
+            continue
         for issue in r['issues']:
             crt += 1
-            vals = [crt, r['pdf_file'], r['nr_pv'], r.get('uat', ''),
-                    r.get('pozitie_hg', ''), issue['camp'], issue['master'], issue['pdf']]
+            vals = [crt, r['source_file'], r['nr_pv'], r.get('uat', ''),
+                    r.get('pozitie_hg', ''), issue['camp'], issue['master'], issue['document']]
             for col, v in enumerate(vals, 1):
                 cell = ws.cell(row=row, column=col, value=v)
                 cell.font = df
@@ -426,11 +365,11 @@ def generate_report(results, output_path):
     ws2 = wb.create_sheet("Sumar")
     ws2['A1'] = 'SUMAR VERIFICARE'
     ws2['A1'].font = Font(name='Arial', bold=True, size=14)
-    ws2['A3'] = 'Total PDF-uri verificate:'
+    ws2['A3'] = 'Total H/PV verificate:'
     ws2['B3'] = len(results)
-    ws2['A4'] = 'PDF-uri OK (fără neconcordanțe):'
+    ws2['A4'] = 'OK (fără neconcordanțe):'
     ws2['B4'] = sum(1 for r in results if not r['issues'])
-    ws2['A5'] = 'PDF-uri cu neconcordanțe:'
+    ws2['A5'] = 'Cu neconcordanțe:'
     ws2['B5'] = sum(1 for r in results if r['issues'])
     ws2['A5'].font = Font(name='Arial', bold=True, color='FF0000')
     ws2['B5'].font = Font(name='Arial', bold=True, color='FF0000')
@@ -441,7 +380,7 @@ def generate_report(results, output_path):
         ws2.column_dimensions[c].width = 35
 
     ws.column_dimensions['A'].width = 8
-    ws.column_dimensions['B'].width = 22
+    ws.column_dimensions['B'].width = 25
     ws.column_dimensions['C'].width = 10
     ws.column_dimensions['D'].width = 15
     ws.column_dimensions['E'].width = 10
